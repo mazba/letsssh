@@ -1,0 +1,439 @@
+#!/usr/bin/env bash
+# letsssh — manage SSH servers and keys on macOS
+# https://github.com/mazba/letsssh
+#
+# Servers are stored in ~/.ssh/config.d/letsssh.conf, which is included from
+# ~/.ssh/config, so Terminal, VS Code, scp and other tools see them too.
+# Run "letsssh help" for usage.
+
+set -euo pipefail
+
+VERSION="1.0.0"
+
+SSH_DIR="$HOME/.ssh"
+CONFIG="$SSH_DIR/config"
+CONF_DIR="$SSH_DIR/config.d"
+DB="$CONF_DIR/letsssh.conf"
+BACKUP_DIR="$CONF_DIR/backups"
+INCLUDE_LINE="Include ~/.ssh/config.d/letsssh.conf"
+RESERVED="add list ls edit remove rm test info connect c help version"
+
+# ---------- output ----------
+red()   { printf '\033[31m%s\033[0m\n' "$*" >&2; }
+green() { printf '\033[32m%s\033[0m\n' "$*" >&2; }
+info()  { printf '\033[36m→ %s\033[0m\n' "$*" >&2; }
+die()   { red "$*"; exit 1; }
+
+usage() {
+  cat <<'EOF'
+letsssh — manage SSH servers and keys on macOS
+
+Usage:
+  letsssh add [key.pem] [--name N] [--host H] [--user U] [--port P]
+      Add a server. With a .pem file, the key is also secured
+      (moved to ~/.ssh, permissions fixed, passphrase, Keychain).
+      Without one, the server uses your default keys or a password.
+
+  letsssh list              List servers and keys not linked to any server
+  letsssh <name>            Connect to a server
+  letsssh                   Pick a server from a list and connect
+  letsssh edit <name> [--name N] [--host H] [--user U] [--port P] [--key PATH|none]
+      Edit a server (asks for each value if no options are given)
+  letsssh remove <name>     Remove a server, optionally moving its key to the Trash
+  letsssh test <name>       Check that key login works
+  letsssh info <name>       Show details
+  letsssh version           Show version
+EOF
+}
+
+# ---------- helpers ----------
+ask() { # ask VAR "Prompt" [default]
+  local __var="$1" __prompt="$2" __def="${3:-}" __ans=""
+  if [ -n "$__def" ]; then
+    read -rp "$__prompt [$__def]: " __ans
+  else
+    read -rp "$__prompt: " __ans
+  fi
+  [ -z "$__ans" ] && __ans="$__def"
+  printf -v "$__var" '%s' "$__ans"
+}
+
+ask_required() { # ask_required VAR "Prompt" [default]
+  local __v=""
+  while [ -z "$__v" ]; do
+    ask __v "$2" "${3:-}"
+    [ -z "$__v" ] && red "This is required."
+  done
+  printf -v "$1" '%s' "$__v"
+}
+
+confirm() { # confirm "Question"
+  local a=""
+  read -rp "$1 [y/N]: " a
+  [[ "$a" =~ ^[Yy]$ ]]
+}
+
+need_value() { [ $# -ge 2 ] && [ -n "$2" ] || die "Option $1 needs a value."; }
+
+valid_name() {
+  [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]] || die "Invalid name '$1' (use letters, numbers, . _ -)."
+  case " $RESERVED " in *" $1 "*) die "'$1' is a command name; choose another name." ;; esac
+}
+valid_host() { [[ "$1" =~ ^[A-Za-z0-9._:-]+$ ]] || die "Invalid host '$1'."; }
+valid_user() { [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]] || die "Invalid user '$1'."; }
+valid_port() {
+  [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ] || die "Invalid port '$1'."
+}
+
+default_name() {
+  basename "$1" | sed -E 's/\.(pem|key)$//; s/[-_]key$//; s/[^A-Za-z0-9._-]/-/g'
+}
+
+# ---------- storage ----------
+ensure_setup() {
+  mkdir -p "$SSH_DIR" "$CONF_DIR" "$BACKUP_DIR"
+  chmod 700 "$SSH_DIR" "$CONF_DIR" "$BACKUP_DIR"
+  if [ ! -f "$DB" ]; then
+    {
+      echo "# Managed by letsssh. Use 'letsssh edit' instead of editing by hand."
+      echo "IgnoreUnknown UseKeychain"
+      echo
+    } > "$DB"
+  fi
+  chmod 600 "$DB"
+  touch "$CONFIG"; chmod 600 "$CONFIG"
+  if ! grep -qxF "$INCLUDE_LINE" "$CONFIG"; then
+    cp "$CONFIG" "$CONFIG.bak.$(date +%Y%m%d-%H%M%S)"
+    local tmp; tmp="$(mktemp "$SSH_DIR/.config.XXXXXX")"
+    { echo "$INCLUDE_LINE"; echo; cat "$CONFIG"; } > "$tmp"
+    mv "$tmp" "$CONFIG"; chmod 600 "$CONFIG"
+    info "Linked letsssh servers into ~/.ssh/config (backup saved)"
+  fi
+}
+
+backup() {
+  [ -f "$DB" ] || return 0
+  cp "$DB" "$BACKUP_DIR/letsssh.conf.$(date +%Y%m%d-%H%M%S)"
+  # keep the 10 most recent backups
+  ls -1t "$BACKUP_DIR"/letsssh.conf.* 2>/dev/null | tail -n +11 | while read -r f; do rm -f "$f"; done
+}
+
+# prints: name|host|user|port|key
+parse_entries() {
+  [ -f "$DB" ] || return 0
+  awk '
+    /^# letsssh:begin /{ name=$3; host=""; user=""; port="22"; key=""; inb=1; next }
+    /^# letsssh:end /  { if (inb) print name "|" host "|" user "|" port "|" key; inb=0; next }
+    inb && $1=="HostName"     { host=$2 }
+    inb && $1=="User"         { user=$2 }
+    inb && $1=="Port"         { port=$2 }
+    inb && $1=="IdentityFile" { key=$2 }
+  ' "$DB"
+}
+
+get_entry() { # sets E_NAME E_HOST E_USER E_PORT E_KEY
+  local line
+  line="$(parse_entries | awk -F'|' -v n="$1" '$1==n { print; exit }')"
+  [ -n "$line" ] || return 1
+  IFS='|' read -r E_NAME E_HOST E_USER E_PORT E_KEY <<EOF
+$line
+EOF
+}
+
+require_entry() {
+  [ -n "${1:-}" ] || die "Give a server name. See: letsssh list"
+  get_entry "$1" || die "No server named '$1'. See: letsssh list"
+}
+
+key_in_use() { # key_in_use PATH [except-name]
+  parse_entries | awk -F'|' -v k="$1" -v n="${2:-}" '$5==k && $1!=n { f=1 } END { exit !f }'
+}
+
+append_block() { # name host user port key
+  {
+    echo "# letsssh:begin $1"
+    echo "Host $1"
+    echo "    HostName $2"
+    echo "    User $3"
+    echo "    Port $4"
+    if [ -n "$5" ]; then
+      echo "    IdentityFile $5"
+      echo "    IdentitiesOnly yes"
+      echo "    AddKeysToAgent yes"
+      echo "    UseKeychain yes"
+    fi
+    echo "# letsssh:end $1"
+    echo
+  } >> "$DB"
+  chmod 600 "$DB"
+}
+
+remove_block() { # name
+  local tmp; tmp="$(mktemp "$CONF_DIR/.letsssh.XXXXXX")"
+  awk -v n="$1" '
+    $0 == "# letsssh:begin " n { skip=1; next }
+    $0 == "# letsssh:end " n   { skip=0; next }
+    !skip { print }
+  ' "$DB" | cat -s > "$tmp"
+  mv "$tmp" "$DB"; chmod 600 "$DB"
+}
+
+# ---------- keys ----------
+SECURED_KEY=""
+secure_key() { # secure_key PATH -> sets SECURED_KEY
+  local src="$1" abs base dest
+  [ -f "$src" ] || die "File not found: $src"
+  grep -q "PRIVATE KEY" "$src" || die "Not a private key file: $src"
+  mkdir -p "$SSH_DIR"; chmod 700 "$SSH_DIR"
+
+  abs="$(cd "$(dirname "$src")" && pwd)/$(basename "$src")"
+  base="$(basename "$src" | tr ' ' '_')"
+  dest="$SSH_DIR/$base"
+
+  if [ "$abs" != "$dest" ]; then
+    [ -e "$dest" ] && die "A file already exists at $dest. Rename one of them first."
+    mv "$abs" "$dest"
+    info "Moved key to $dest"
+  fi
+  chmod 600 "$dest"
+
+  if ssh-keygen -y -P "" -f "$dest" >/dev/null 2>&1; then
+    info "Adding a passphrase to the key (type it twice, at least 5 characters)"
+    local tries=0
+    until ssh-keygen -p -m PEM -f "$dest" >/dev/null; do
+      tries=$((tries + 1))
+      [ "$tries" -ge 3 ] && die "Passphrase not set. The key is at $dest; run: letsssh add $dest"
+      red "That didn't work, try again."
+    done
+  fi
+
+  info "Saving passphrase to Keychain"
+  ssh-add --apple-use-keychain "$dest"
+  SECURED_KEY="$dest"
+}
+
+trash_file() { # move to Trash, fall back to ~/.ssh/removed
+  local f="$1" dest="$HOME/.Trash/$(basename "$1")"
+  [ -e "$dest" ] && dest="$dest.$(date +%Y%m%d-%H%M%S)"
+  if mv "$f" "$dest" 2>/dev/null; then
+    info "Moved $(basename "$f") to the Trash"
+  else
+    mkdir -p "$SSH_DIR/removed"; chmod 700 "$SSH_DIR/removed"
+    mv "$f" "$SSH_DIR/removed/"
+    info "Moved $(basename "$f") to $SSH_DIR/removed/"
+  fi
+}
+
+# ---------- commands ----------
+cmd_add() {
+  local pem="" name="" host="" user="" port="" key="" def=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name) need_value "$@"; name="$2"; shift 2 ;;
+      --host) need_value "$@"; host="$2"; shift 2 ;;
+      --user) need_value "$@"; user="$2"; shift 2 ;;
+      --port) need_value "$@"; port="$2"; shift 2 ;;
+      -*) die "Unknown option: $1" ;;
+      *) [ -z "$pem" ] || die "Unexpected argument: $1"; pem="$1"; shift ;;
+    esac
+  done
+
+  if [ -n "$pem" ]; then
+    [ -f "$pem" ] || die "File not found: $pem"
+    grep -q "PRIVATE KEY" "$pem" || die "Not a private key file: $pem"
+    def="$(default_name "$pem")"
+  fi
+
+  [ -n "$name" ] || ask_required name "Server name" "$def"
+  [ -n "$host" ] || ask_required host "Host or IP"
+  [ -n "$user" ] || ask_required user "Username (e.g. ubuntu, ec2-user)"
+  [ -n "$port" ] || port=22
+
+  valid_name "$name"; valid_host "$host"; valid_user "$user"; valid_port "$port"
+  get_entry "$name" && die "Server '$name' already exists. Use: letsssh edit $name"
+
+  ensure_setup
+  if [ -n "$pem" ]; then
+    secure_key "$pem"
+    key="$SECURED_KEY"
+  fi
+
+  backup
+  append_block "$name" "$host" "$user" "$port" "$key"
+  green "✓ Added '$name'. Connect with: letsssh $name"
+}
+
+cmd_list() {
+  local rows n h u p k
+  rows="$(parse_entries)"
+  if [ -z "$rows" ]; then
+    echo "No servers yet. Add one with: letsssh add key.pem   (or: letsssh add)"
+  else
+    {
+      echo "NAME|HOST|USER|PORT|KEY"
+      while IFS='|' read -r n h u p k; do
+        if [ -n "$k" ]; then k="$(basename "$k")"; else k="-"; fi
+        echo "$n|$h|$u|$p|$k"
+      done <<EOF
+$rows
+EOF
+    } | column -t -s '|'
+  fi
+
+  local f printed=0
+  for f in "$SSH_DIR"/*; do
+    [ -f "$f" ] || continue
+    case "$(basename "$f")" in
+      *.pub|config|config.*|known_hosts*|authorized_keys*|*.bak*) continue ;;
+    esac
+    head -c 200 "$f" 2>/dev/null | grep -q "PRIVATE KEY" || continue
+    key_in_use "$f" && continue
+    if [ $printed -eq 0 ]; then echo; echo "Keys not linked to any server:"; printed=1; fi
+    echo "  $(basename "$f")"
+  done
+}
+
+cmd_connect() {
+  require_entry "${1:-}"
+  local name="$1"; shift
+  exec ssh "$name" "$@"
+}
+
+cmd_pick() {
+  local rows; rows="$(parse_entries)"
+  [ -n "$rows" ] || { cmd_list; exit 0; }
+
+  if command -v fzf >/dev/null 2>&1; then
+    local sel
+    sel="$(echo "$rows" | awk -F'|' '{ printf "%s\t%s@%s\n", $1, $3, $2 }' \
+          | fzf --prompt="server> " --height=40% --reverse --with-nth=1,2 --delimiter=$'\t')" || exit 0
+    cmd_connect "${sel%%$'\t'*}"
+  fi
+
+  local names=() n h u p k i=1 choice
+  while IFS='|' read -r n h u p k; do
+    names+=("$n")
+    printf "  %2d) %-24s %s@%s\n" "$i" "$n" "$u" "$h"
+    i=$((i + 1))
+  done <<EOF
+$rows
+EOF
+  read -rp "Connect to (number or name, Enter to cancel): " choice || exit 0
+  [ -n "$choice" ] || exit 0
+  if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le ${#names[@]} ]; then
+    choice="${names[$((choice - 1))]}"
+  fi
+  cmd_connect "$choice"
+}
+
+cmd_edit() {
+  require_entry "${1:-}"
+  local old="$1"; shift
+  local name="$E_NAME" host="$E_HOST" user="$E_USER" port="$E_PORT" key="$E_KEY"
+  local newkey="" flags=0
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name) need_value "$@"; name="$2"; flags=1; shift 2 ;;
+      --host) need_value "$@"; host="$2"; flags=1; shift 2 ;;
+      --user) need_value "$@"; user="$2"; flags=1; shift 2 ;;
+      --port) need_value "$@"; port="$2"; flags=1; shift 2 ;;
+      --key)  need_value "$@"; newkey="$2"; flags=1; shift 2 ;;
+      *) die "Unknown option: $1" ;;
+    esac
+  done
+
+  if [ $flags -eq 0 ]; then
+    echo "Editing '$old' (press Enter to keep the current value)"
+    ask name "Name" "$name"
+    ask host "Host" "$host"
+    ask user "User" "$user"
+    ask port "Port" "$port"
+    ask newkey "Key file (path, or 'none' to remove)" "${key:-none}"
+    [ "$newkey" = "${key:-none}" ] && newkey=""
+  fi
+
+  valid_name "$name"; valid_host "$host"; valid_user "$user"; valid_port "$port"
+  if [ "$name" != "$old" ] && get_entry "$name"; then
+    die "Server '$name' already exists."
+  fi
+
+  ensure_setup
+  if [ "$newkey" = "none" ]; then
+    key=""
+  elif [ -n "$newkey" ]; then
+    newkey="${newkey/#\~/$HOME}"
+    secure_key "$newkey"
+    key="$SECURED_KEY"
+  fi
+
+  backup
+  remove_block "$old"
+  append_block "$name" "$host" "$user" "$port" "$key"
+  green "✓ Updated '$name'"
+}
+
+cmd_remove() {
+  require_entry "${1:-}"
+  local name="$E_NAME" key="$E_KEY"
+  confirm "Remove server '$name' ($E_USER@$E_HOST)?" || { echo "Cancelled."; exit 0; }
+
+  backup
+  remove_block "$name"
+  green "✓ Removed '$name'"
+
+  if [ -n "$key" ] && [ -f "$key" ]; then
+    if key_in_use "$key"; then
+      info "Key $(basename "$key") is still used by other servers, so it was kept."
+    elif confirm "Also remove the key $(basename "$key")? (it goes to the Trash)"; then
+      ssh-add -d --apple-use-keychain "$key" >/dev/null 2>&1 || true
+      trash_file "$key"
+      [ -f "$key.pub" ] && trash_file "$key.pub"
+    fi
+  fi
+}
+
+cmd_test() {
+  require_entry "${1:-}"
+  info "Testing $E_USER@$E_HOST ..."
+  if ssh -o BatchMode=yes -o ConnectTimeout=10 "$E_NAME" true 2>/dev/null; then
+    green "✓ '$E_NAME' is reachable and login works."
+  else
+    red "✗ Could not log in to '$E_NAME'."
+    echo "  If this server uses a password, the test can't check it; just try: letsssh $E_NAME"
+    echo "  For details, run: ssh -v $E_NAME"
+    exit 1
+  fi
+}
+
+cmd_info() {
+  require_entry "${1:-}"
+  echo "Name:  $E_NAME"
+  echo "Host:  $E_HOST"
+  echo "User:  $E_USER"
+  echo "Port:  $E_PORT"
+  echo "Key:   ${E_KEY:-none (default keys or password)}"
+  echo
+  if [ -n "$E_KEY" ]; then
+    echo "Same as: ssh -i $E_KEY -p $E_PORT $E_USER@$E_HOST"
+  else
+    echo "Same as: ssh -p $E_PORT $E_USER@$E_HOST"
+  fi
+}
+
+# ---------- main ----------
+[ "$(uname)" = "Darwin" ] || die "letsssh is made for macOS."
+
+case "${1:-}" in
+  "")              cmd_pick ;;
+  add)             shift; cmd_add "$@" ;;
+  list|ls)         cmd_list ;;
+  edit)            shift; cmd_edit "$@" ;;
+  remove|rm)       shift; cmd_remove "$@" ;;
+  test)            shift; cmd_test "$@" ;;
+  info)            shift; cmd_info "$@" ;;
+  connect|c)       shift; cmd_connect "$@" ;;
+  help|-h|--help)  usage ;;
+  version|-v|--version) echo "letsssh $VERSION" ;;
+  *)               cmd_connect "$@" ;;
+esac

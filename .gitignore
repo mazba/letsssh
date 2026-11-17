@@ -1,0 +1,7 @@
+# Never commit private keys
+*.pem
+*.key
+id_*
+!id_*.pub
+.DS_Store
+.claude/
